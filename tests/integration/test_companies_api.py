@@ -105,3 +105,32 @@ async def test_enrichment_failure_degrades(
     assert body["data"]["localizacao"] is None
     assert body["data"]["endereco"]["cep"] == "01310-100"
     assert any("não enriquecido" in a for a in body["meta"]["avisos"])
+
+
+async def test_enrichment_failure_caches_company_with_short_ttl(
+    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter, redis, settings
+) -> None:
+    import json
+    import time
+
+    mock_cnpj(upstream)
+    for base, path in [("brasilapi", "/cep/v2/{c}"), ("viacep", "/{c}/json/"), ("opencep", "/{c}")]:
+        upstream.get(URLS[base] + path.format(c=p.CEP)).respond(500)
+    assert (await client.get(f"/v1/empresas/{p.CNPJ}", headers=auth)).status_code == 200
+    entry = json.loads(await redis.get(f"raiox:v1:cnpj:{p.CNPJ}"))
+    assert entry["fresh_until"] - time.time() <= settings.ttl_degraded_s
+
+
+async def test_failed_primary_source_alone_does_not_degrade_company(
+    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter, redis, settings
+) -> None:
+    """Registry data is the same in every source, so a successful fallback is a full result."""
+    import json
+    import time
+
+    mock_cnpj(upstream)
+    mock_cep(upstream)
+    upstream.get(f"{URLS['brasilapi']}/cnpj/v1/{p.CNPJ}").respond(502)
+    assert (await client.get(f"/v1/empresas/{p.CNPJ}", headers=auth)).status_code == 200
+    entry = json.loads(await redis.get(f"raiox:v1:cnpj:{p.CNPJ}"))
+    assert entry["fresh_until"] - time.time() > settings.ttl_degraded_s

@@ -87,7 +87,7 @@ class Cache:
         model: type[M],
         loader: Callable[[], Awaitable[M]],
         *,
-        ttl_s: int,
+        ttl_s: int | Callable[[M], int],
         negative_ttl_s: int,
         stale_ttl_s: int,
     ) -> CachedValue[M]:
@@ -127,11 +127,12 @@ class Cache:
                     )
                 raise
 
-            fresh_until = self._clock() + ttl_s
+            ttl = ttl_s(value) if callable(ttl_s) else ttl_s  # e.g. shorter when degraded
+            fresh_until = self._clock() + ttl
             await self._write(
                 key,
                 _Entry(fresh_until, False, None, value.model_dump(mode="json")),
-                ttl_s + stale_ttl_s,
+                ttl + stale_ttl_s,
             )
             CACHE_EVENTS.labels(resource, "miss").inc()
             return CachedValue(value, CacheStatus.MISS, fresh_until)

@@ -1,4 +1,4 @@
-.PHONY: install dev lint fmt typecheck test check up down logs
+.PHONY: install dev lint fmt typecheck test check up down logs snapshot
 
 install:     ## Install dependencies (including dev)
 	uv sync
@@ -30,3 +30,6 @@ down:
 
 logs:
 	docker compose logs -f api
+
+snapshot:    ## Rebuild the IBGE municipalities snapshot (needs a Brazilian IP)
+	uv run python scripts/build_ibge_snapshot.py

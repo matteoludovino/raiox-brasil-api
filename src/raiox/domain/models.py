@@ -25,6 +25,17 @@ class SourceStatus(StrEnum):
     SKIPPED = "ignorada"
 
 
+# Failures that may go away on their own (as opposed to "not found" or "rejected").
+TRANSIENT_FAILURES = frozenset(
+    {
+        SourceStatus.ERROR,
+        SourceStatus.TIMEOUT,
+        SourceStatus.CIRCUIT_OPEN,
+        SourceStatus.QUOTA_EXCEEDED,
+    }
+)
+
+
 class CacheStatus(StrEnum):
     HIT = "HIT"
     MISS = "MISS"
@@ -53,6 +64,9 @@ class Aggregate[T: BaseModel](BaseModel):
     fontes: list[SourceInfo] = Field(default_factory=list)
     avisos: list[str] = Field(default_factory=list)
     obtido_em: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    # Internal (not exposed in the response): built while a source failed transiently,
+    # so it is cached with a short TTL instead of the resource's full TTL.
+    degraded: bool = False
 
 
 # --- CEP (postal code) ----------------------------------------------------------

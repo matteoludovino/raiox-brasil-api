@@ -133,15 +133,85 @@ async def test_all_down_503_then_stale(
     assert "stale-if-error" in r.json()["meta"]["avisos"][0]
 
 
-async def test_ibge_down_does_not_break_cep(
-    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter
+async def test_ibge_down_falls_back_to_snapshot_with_full_ttl(
+    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter, redis, settings
 ) -> None:
     mock_cep(upstream)
     upstream.get(f"{URLS['ibge']}/localidades/municipios/{p.IBGE_SP}").respond(500)
     r = await client.get(f"/v1/cep/{p.CEP}", headers=auth)
     assert r.status_code == 200
+    body = r.json()
+    assert body["data"]["municipio"]["mesorregiao"] == "Metropolitana de São Paulo"
+    sources = {f["nome"]: f["status"] for f in body["meta"]["fontes"]}
+    assert sources["ibge"] == "erro"
+    assert sources["ibge:snapshot"] == "ok"
+    assert any("snapshot" in w for w in body["meta"]["avisos"])
+    # Data is complete (snapshot covered it): cached with the full CEP TTL, not the short one.
+    assert await _freshness(redis, f"raiox:v1:cep:{p.CEP}") > settings.ttl_degraded_s
+
+
+async def test_ibge_down_and_code_missing_from_snapshot_is_degraded(
+    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter, redis, settings
+) -> None:
+    cep, code = "01001000", "9999999"
+    upstream.get(f"{URLS['brasilapi']}/cep/v2/{cep}").respond(json=p.BRASILAPI_CEP)
+    upstream.get(f"{URLS['viacep']}/{cep}/json/").respond(json={**p.VIACEP, "ibge": code})
+    upstream.get(f"{URLS['opencep']}/{cep}").respond(json={**p.OPENCEP, "ibge": code})
+    upstream.get(f"{URLS['ibge']}/localidades/municipios/{code}").respond(503)
+
+    r = await client.get(f"/v1/cep/{cep}", headers=auth)
+    assert r.status_code == 200
     assert r.json()["data"]["municipio"] is None
-    assert any("IBGE" in a for a in r.json()["meta"]["avisos"])
+    assert any("IBGE" in w for w in r.json()["meta"]["avisos"])
+    assert await _freshness(redis, f"raiox:v1:cep:{cep}") <= settings.ttl_degraded_s
+
+
+async def test_slow_ibge_is_cut_by_enrichment_deadline(
+    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter, settings
+) -> None:
+    import asyncio
+    import time
+
+    mock_cep(upstream)
+
+    async def slow_ibge(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(5)
+        return httpx.Response(200, json=p.IBGE_MUNICIPIO)
+
+    upstream.get(f"{URLS['ibge']}/localidades/municipios/{p.IBGE_SP}").mock(side_effect=slow_ibge)
+    settings.enrichment_deadline_s = 0.3
+
+    start = time.perf_counter()
+    r = await client.get(f"/v1/cep/{p.CEP}", headers=auth)
+    assert time.perf_counter() - start < 1.5  # did not wait for IBGE
+    assert r.status_code == 200
+    assert r.json()["data"]["municipio"]["regiao"] == "Sudeste"  # from the snapshot
+    ibge = next(f for f in r.json()["meta"]["fontes"] if f["nome"] == "ibge")
+    assert ibge["detalhe"] == "deadline"
+
+
+async def test_partial_result_is_cached_with_short_ttl(
+    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter, redis, settings
+) -> None:
+    mock_cep(upstream)
+    upstream.get(f"{URLS['brasilapi']}/cep/v2/{p.CEP}").respond(500)
+    assert (await client.get(f"/v1/cep/{p.CEP}", headers=auth)).status_code == 200
+    assert await _freshness(redis, f"raiox:v1:cep:{p.CEP}") <= settings.ttl_degraded_s
+
+
+async def test_healthy_result_is_cached_with_full_ttl(
+    client: httpx.AsyncClient, auth: dict[str, str], upstream: respx.MockRouter, redis, settings
+) -> None:
+    mock_cep(upstream)
+    assert (await client.get(f"/v1/cep/{p.CEP}", headers=auth)).status_code == 200
+    assert await _freshness(redis, f"raiox:v1:cep:{p.CEP}") > settings.ttl_cep_s - 60
+
+
+async def _freshness(redis, key: str) -> float:
+    import json
+    import time
+
+    return float(json.loads(await redis.get(key))["fresh_until"]) - time.time()
 
 
 async def _expire(redis, key: str) -> None:

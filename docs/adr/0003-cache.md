@@ -11,7 +11,7 @@ One key per resource holding an envelope `{fresh_until, nf, detail, data}`:
 - **Fail-open:** a Redis error becomes a cache miss, never a client error.
 - Versioned keys (`raiox:v1:`): changing the envelope format means bumping the prefix, no migration needed.
 
-TTLs: CEP 7d (rarely changes), CNPJ 24h (registry status changes), IBGE municipality 30d.
+TTLs: CEP 7d (rarely changes), CNPJ 24h (registry status changes), IBGE municipality 30d. A result built while a source failed transiently (*degraded*) gets a **5-minute** TTL instead, so a passing outage doesn't freeze incomplete data for days (ADR 0007). The TTL is chosen per value: `get_or_load` accepts a function of the loaded value.
 
 ## HTTP
 A **weak** `ETag` computed over `data` only, because `meta` changes on every request (request_id, cache status) while the representation is semantically the same. `If-None-Match` → 304. `Cache-Control: private, max-age=<remaining freshness>`, `private` because the response depends on the API key (rate limit headers).

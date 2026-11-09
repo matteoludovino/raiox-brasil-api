@@ -71,20 +71,24 @@ class IbgeMunicipalities(BaseProvider):
         d = await self._get_json(f"/localidades/municipios/{code}")
         if not d or not isinstance(d, dict):  # IBGE answers 200 [] for an unknown code
             raise ProviderNotFound("ibge: município não encontrado")
+        return parse_municipality(d, code)
 
-        micro = d.get("microrregiao") or {}
-        meso = micro.get("mesorregiao") or {}
-        immediate = d.get("regiao-imediata") or {}
-        intermediate = immediate.get("regiao-intermediaria") or {}
-        # Some newer municipalities have no microregion: fall back to the immediate region.
-        uf = meso.get("UF") or intermediate.get("UF") or {}
-        return Municipality(
-            codigo_ibge=str(d.get("id", code)),
-            nome=str(d.get("nome", "")),
-            uf=text(uf.get("sigla")),
-            microrregiao=text(micro.get("nome")),
-            mesorregiao=text(meso.get("nome")),
-            regiao_imediata=text(immediate.get("nome")),
-            regiao_intermediaria=text(intermediate.get("nome")),
-            regiao=text((uf.get("regiao") or {}).get("nome")),
-        )
+
+def parse_municipality(d: dict[str, Any], code: str | None = None) -> Municipality:
+    """Shared by the live provider and the snapshot builder (scripts/build_ibge_snapshot.py)."""
+    micro = d.get("microrregiao") or {}
+    meso = micro.get("mesorregiao") or {}
+    immediate = d.get("regiao-imediata") or {}
+    intermediate = immediate.get("regiao-intermediaria") or {}
+    # Some newer municipalities have no microregion: fall back to the immediate region.
+    uf = meso.get("UF") or intermediate.get("UF") or {}
+    return Municipality(
+        codigo_ibge=str(d.get("id", code or "")),
+        nome=str(d.get("nome", "")),
+        uf=text(uf.get("sigla")),
+        microrregiao=text(micro.get("nome")),
+        mesorregiao=text(meso.get("nome")),
+        regiao_imediata=text(immediate.get("nome")),
+        regiao_intermediaria=text(intermediate.get("nome")),
+        regiao=text((uf.get("regiao") or {}).get("nome")),
+    )

@@ -5,7 +5,9 @@ Why fan-out instead of fallback? CEP sources are free, have no tight quota and a
 all in parallel costs the latency of the slowest one (capped by a deadline) and yields the most
 complete record. See ADR 0001.
 
-Warnings and error details are returned to API clients, so they stay in Portuguese.
+Municipality enrichment is optional and time-boxed: live IBGE first, local snapshot as a
+fallback (ADR 0007). Warnings and error details are returned to API clients, so they stay in
+Portuguese.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from raiox.core.config import Settings
 from raiox.core.errors import NotFoundError, UpstreamUnavailableError
 from raiox.domain.merge import merge_cep
 from raiox.domain.models import (
+    TRANSIENT_FAILURES,
     Address,
     AddressPartial,
     Aggregate,
@@ -29,6 +32,7 @@ from raiox.domain.models import (
 from raiox.domain.validators import format_cep
 from raiox.infra.cache import Cache, CachedValue
 from raiox.providers.cep import IbgeMunicipalities
+from raiox.providers.ibge_snapshot import IbgeSnapshot
 from raiox.services.sources import ms_since, observe
 
 
@@ -43,11 +47,13 @@ class CepService:
         self,
         providers: Sequence[CepProvider],
         ibge: IbgeMunicipalities,
+        snapshot: IbgeSnapshot,
         cache: Cache,
         settings: Settings,
     ) -> None:
         self._providers = list(providers)  # order = merge precedence
         self._ibge = ibge
+        self._snapshot = snapshot
         self._cache = cache
         self._s = settings
 
@@ -56,7 +62,7 @@ class CepService:
             f"cep:{cep}",
             Aggregate[Address],
             lambda: self._load(cep),
-            ttl_s=self._s.ttl_cep_s,
+            ttl_s=lambda agg: self._s.ttl_degraded_s if agg.degraded else self._s.ttl_cep_s,
             negative_ttl_s=self._s.ttl_negative_s,
             stale_ttl_s=self._s.ttl_stale_s,
         )
@@ -69,6 +75,7 @@ class CepService:
                 raise NotFoundError(f"CEP {format_cep(cep)} não encontrado")
             raise UpstreamUnavailableError("Nenhuma fonte de CEP disponível no momento")
 
+        degraded = any(s.status in TRANSIENT_FAILURES for s in sources)
         fields, provenance, warnings = merge_cep(parts)
         failed = [s.nome for s in sources if s.status is not SourceStatus.OK]
         if failed:
@@ -76,17 +83,21 @@ class CepService:
 
         municipality: Municipality | None = None
         if code := fields.get("codigo_ibge"):
-            municipality, ibge_info = await self._municipality(code)
-            sources.append(ibge_info)
-            if municipality is None:
-                warnings.append("Dados do município (IBGE) indisponíveis no momento.")
+            municipality, ibge_sources, ibge_warning = await self._municipality(code)
+            sources.extend(ibge_sources)
+            if ibge_warning:
+                warnings.append(ibge_warning)
+            # Missing municipality because IBGE failed (and the snapshot didn't cover it).
+            degraded = degraded or (
+                municipality is None and any(s.status in TRANSIENT_FAILURES for s in ibge_sources)
+            )
         else:
             warnings.append("Código IBGE não informado pelas fontes; município não enriquecido.")
 
         address = Address(
             cep=format_cep(cep), municipio=municipality, proveniencia=provenance, **fields
         )
-        return Aggregate[Address](data=address, fontes=sources, avisos=warnings)
+        return Aggregate[Address](data=address, fontes=sources, avisos=warnings, degraded=degraded)
 
     async def _fan_out(self, cep: str) -> tuple[list[tuple[str, AddressPartial]], list[SourceInfo]]:
         tasks = {
@@ -112,8 +123,13 @@ class CepService:
                 parts.append((name, result))
         return parts, sources
 
-    async def _municipality(self, code: str) -> tuple[Municipality | None, SourceInfo]:
-        """Municipalities almost never change: own 30-day cache, shared across CEPs."""
+    async def _municipality(
+        self, code: str
+    ) -> tuple[Municipality | None, list[SourceInfo], str | None]:
+        """Live IBGE (own 30-day cache) under a hard deadline, then the local snapshot.
+
+        Returns (municipality, sources involved, warning for the client).
+        """
 
         async def load() -> Municipality:
             result, info = await observe(self._ibge.name, self._ibge.get_municipality(code))
@@ -125,24 +141,56 @@ class CepService:
 
         start = time.perf_counter()
         try:
-            cached = await self._cache.get_or_load(
-                f"ibge:municipio:{code}",
-                Municipality,
-                load,
-                ttl_s=self._s.ttl_ibge_s,
-                negative_ttl_s=self._s.ttl_negative_s,
-                stale_ttl_s=self._s.ttl_stale_s,
+            async with asyncio.timeout(self._s.enrichment_deadline_s):
+                cached = await self._cache.get_or_load(
+                    f"ibge:municipio:{code}",
+                    Municipality,
+                    load,
+                    ttl_s=self._s.ttl_ibge_s,
+                    negative_ttl_s=self._s.ttl_negative_s,
+                    stale_ttl_s=self._s.ttl_stale_s,
+                )
+        except NotFoundError as exc:
+            info = SourceInfo(
+                nome="ibge",
+                status=SourceStatus.NOT_FOUND,
+                latencia_ms=ms_since(start),
+                detalhe=exc.detail,
             )
-        except (NotFoundError, UpstreamUnavailableError) as exc:
-            status = (
-                SourceStatus.NOT_FOUND if isinstance(exc, NotFoundError) else SourceStatus.ERROR
+            return None, [info], "Município não encontrado no IBGE."
+        except (UpstreamUnavailableError, TimeoutError) as exc:
+            detail = exc.detail if isinstance(exc, UpstreamUnavailableError) else "deadline"
+            live = SourceInfo(
+                nome="ibge", status=SourceStatus.ERROR, latencia_ms=ms_since(start), detalhe=detail
             )
-            return None, SourceInfo(
-                nome="ibge", status=status, latencia_ms=ms_since(start), detalhe=exc.detail
-            )
-        return cached.value, SourceInfo(
+            return self._from_snapshot(code, live)
+
+        live = SourceInfo(
             nome="ibge",
             status=SourceStatus.OK,
             latencia_ms=ms_since(start),
             detalhe=f"cache {cached.status}",
         )
+        return cached.value, [live], None
+
+    def _from_snapshot(
+        self, code: str, live: SourceInfo
+    ) -> tuple[Municipality | None, list[SourceInfo], str | None]:
+        municipality = self._snapshot.lookup(code)
+        if municipality is None:
+            missing = SourceInfo(
+                nome=self._snapshot.name,
+                status=SourceStatus.NOT_FOUND,
+                detalhe="código ausente no snapshot",
+            )
+            return None, [live, missing], "Dados do município (IBGE) indisponíveis no momento."
+        used = SourceInfo(
+            nome=self._snapshot.name,
+            status=SourceStatus.OK,
+            detalhe=f"snapshot de {self._snapshot.generated_at}",
+        )
+        warning = (
+            "IBGE indisponível: município obtido do snapshot local "
+            f"(gerado em {self._snapshot.generated_at})."
+        )
+        return municipality, [live, used], warning

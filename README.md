@@ -6,6 +6,23 @@ Aggregator API for Brazilian public data: **CEP** (postal codes) and **CNPJ** (c
 
 ![Python](https://img.shields.io/badge/python-3.13-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.16x-009688) ![Redis](https://img.shields.io/badge/Redis-7.4-red) ![coverage](https://img.shields.io/badge/coverage-95%25-brightgreen) ![mypy](https://img.shields.io/badge/mypy-strict-informational)
 
+## Live demo
+
+**Swagger UI:** https://raiox-brasil-api.onrender.com/docs: click *Authorize* and paste the public demo key:
+
+```
+rx_live_ML75IugjP0ff2xFcxWyM24DXLAikiCZ0
+```
+
+```bash
+curl -s https://raiox-brasil-api.onrender.com/v1/cep/01310-100 -H "X-API-Key: rx_live_ML75IugjP0ff2xFcxWyM24DXLAikiCZ0"
+curl -s https://raiox-brasil-api.onrender.com/v1/empresas/00.000.000/0001-91 -H "X-API-Key: rx_live_ML75IugjP0ff2xFcxWyM24DXLAikiCZ0"
+```
+
+- Hosted on Render's free plan: **the first request after a period of inactivity can take up to a minute** while the instance wakes up.
+- The demo key uses the `demo` plan (20 req/min **shared by every visitor**). A `429` with `Retry-After` means the rate limiter is doing its job.
+- The server runs in the US, where the IBGE API is unreachable: municipality data comes from the local snapshot ([ADR 0007](docs/adr/0007-ibge-snapshot.md)), as `meta.fontes` shows.
+
 > **Language note:** code, docs and commits are in English. The **JSON contract** (field names, status values, error messages and warnings) is in Portuguese, because the API serves Brazilian data to Brazilian clients and mirrors the official terminology (`logradouro`, `razao_social`, `situacao_cadastral`…).
 
 ---
@@ -106,10 +123,12 @@ CEP sources are free and **complementary**: BrasilAPI has coordinates, ViaCEP ha
 - **Retry only on transient errors** (5xx, network, timeout), with exponential backoff and *full jitter*. 4xx is never retried. Quota-limited sources get `retries=0`, because the fallback chain already plays that role.
 - **Circuit breaker** per source (`closed → open → half_open`). A 404 does **not** count as a failure, since the source did answer. Validated live: with the sources down, the circuits open and subsequent requests fail in **~8 ms** without touching the network.
 - **Partial responses**: one working source is enough. Whatever is missing goes into `meta.avisos`.
+- **Time-boxed enrichment** with a **local snapshot fallback** for IBGE municipalities ([ADR 0007](docs/adr/0007-ibge-snapshot.md)). Found in production: IBGE doesn't answer from outside Brazil, which made the first lookup take ~15 s. Now it's ~2 s, then ~0.5 s once the IBGE circuit opens.
 
 ### 3. Caching ([ADR 0003](docs/adr/0003-cache.md))
 - **Cache-aside** on Redis with versioned keys (`raiox:v1:...`) and per-resource TTLs: CEP 7d, CNPJ 24h, municipality 30d.
 - **Negative caching** (404 for 1h): non-existent CEPs/CNPJs don't hammer the sources.
+- **Short TTL for degraded results** (5 min): data that came out incomplete because a source failed transiently is not frozen in the cache for days; it heals on its own.
 - **Single-flight** with `SET NX` on Redis: concurrent requests for the same key trigger **one** trip to the sources (tested with 10 concurrent requests). Since the lock lives in Redis, this also holds across replicas.
 - **Stale-if-error**: each entry stores `fresh_until` and lives beyond it. If every source fails, the last copy is served with `X-Cache: STALE` and a warning.
 - **HTTP caching**: weak `ETag` over the data, `If-None-Match → 304`, and `Cache-Control: private, max-age=<remaining freshness>`.
@@ -134,7 +153,7 @@ CEP sources are free and **complementary**: BrasilAPI has coordinates, ViaCEP ha
 |---|---|---|
 | 1 CEP source | 200 partial + warning | other sources cover for it |
 | every source | 200 `STALE` or 503 | an old copy beats no answer |
-| IBGE | 200 without `municipio` + warning | enrichment is optional |
+| IBGE | 200 with municipality from the local snapshot | reference data; enrichment is optional and time-boxed |
 | Redis (cache) | lookup proceeds without cache | cache is an optimization |
 | Redis (rate limit) | serves without limiting (fail-open) | availability over strictness |
 | Redis (auth) | 503 (fail-closed) | security over availability |
@@ -165,7 +184,7 @@ make dev
 ```
 
 **Deploying to Render (free) + Upstash (free):** the repo ships a [`render.yaml`](render.yaml) Blueprint.
-1. Create a free Redis database on [Upstash](https://upstash.com) in **us-east-1** (eviction off) and copy its `rediss://` URL.
+1. Create a free Redis database on [Upstash](https://upstash.com) in **us-east-1** (eviction off). Build the URL as `rediss://default:<TOKEN>@<endpoint>:6379`. Note the **double s** (TLS): Upstash's `redis-cli --tls -u redis://...` example puts TLS in a flag, so copying only its URL silently drops it.
 2. On Render: *New → Blueprint* → pick this repository. The service runs in **Virginia**, next to the database: every request runs several Redis commands, so app↔Redis latency matters more than app↔sources latency (the cache absorbs most of the latter).
 3. Fill the two secrets the Blueprint asks for: `RAIOX_REDIS_URL` and `RAIOX_DEMO_API_KEY` (`python -c "import secrets; print('rx_live_' + secrets.token_urlsafe(24))"`). `RAIOX_ADMIN_TOKEN` is generated by Render.
 
@@ -183,7 +202,7 @@ A [`fly.toml`](fly.toml) is also included (São Paulo region, auto-stop, `/healt
 make check   # ruff + mypy --strict + pytest (85% minimum coverage)
 ```
 
-- **79 tests**, **95% coverage**, with no network calls at all: sources are mocked with `respx` and Redis with `fakeredis` (Lua scripts included).
+- **93 tests**, **95% coverage**, with no network calls at all: sources are mocked with `respx` and Redis with `fakeredis` (Lua scripts included).
 - They cover merging and source disagreement, circuit breaker transitions, retry, the sliding window with a controlled clock, the token bucket, concurrent single-flight, stale-if-error, negative caching, ETag/304, per-plan rate limiting, the key lifecycle, the fan-out deadline and the alphanumeric CNPJ.
 - GitHub Actions CI: lint → types → tests → image build.
 

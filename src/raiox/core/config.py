@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     retry_base_delay_s: float = Field(default=0.2, ge=0)
     retry_max_delay_s: float = Field(default=2.0, ge=0)
     aggregate_deadline_s: float = Field(default=6.0, gt=0)
+    # Hard cap for optional enrichment (IBGE): it must never dominate response time.
+    enrichment_deadline_s: float = Field(default=2.0, gt=0)
     breaker_failure_threshold: int = Field(default=5, ge=1)
     breaker_reset_timeout_s: float = Field(default=30.0, gt=0)
 
@@ -46,6 +48,8 @@ class Settings(BaseSettings):
     ttl_cnpj_s: int = 24 * 3600
     ttl_ibge_s: int = 30 * 24 * 3600
     ttl_negative_s: int = 3600
+    # Results built while a source was failing transiently expire fast, so they heal.
+    ttl_degraded_s: int = 300
     ttl_stale_s: int = 30 * 24 * 3600
     cache_lock_ttl_s: float = 10.0
     cache_lock_wait_s: float = 7.0

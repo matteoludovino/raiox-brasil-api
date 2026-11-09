@@ -16,7 +16,14 @@ from typing import Protocol
 
 from raiox.core.config import Settings
 from raiox.core.errors import AppError, NotFoundError, UpstreamUnavailableError
-from raiox.domain.models import Address, Aggregate, Company, SourceInfo, SourceStatus
+from raiox.domain.models import (
+    TRANSIENT_FAILURES,
+    Address,
+    Aggregate,
+    Company,
+    SourceInfo,
+    SourceStatus,
+)
 from raiox.domain.validators import format_cnpj, is_alphanumeric_cnpj, normalize_cep
 from raiox.infra.cache import Cache, CachedValue
 from raiox.services.cep_service import CepService
@@ -47,7 +54,7 @@ class CompanyService:
             f"cnpj:{cnpj}",
             Aggregate[Company],
             lambda: self._load(cnpj),
-            ttl_s=self._s.ttl_cnpj_s,
+            ttl_s=lambda agg: self._s.ttl_degraded_s if agg.degraded else self._s.ttl_cnpj_s,
             negative_ttl_s=self._s.ttl_negative_s,
             stale_ttl_s=self._s.ttl_stale_s,
         )
@@ -82,29 +89,41 @@ class CompanyService:
                 )
             raise UpstreamUnavailableError("Nenhuma fonte de CNPJ disponível no momento")
 
+        # Registry data is complete once any source answered (same origin), so a failed
+        # source before it does not make the result degraded. Only enrichment can.
+        degraded = False
         if company.endereco.cep:
-            company.localizacao, cep_info = await self._enrich(company.endereco.cep, warnings)
+            company.localizacao, cep_info, degraded = await self._enrich(
+                company.endereco.cep, warnings
+            )
             sources.append(cep_info)
 
-        return Aggregate[Company](data=company, fontes=sources, avisos=warnings)
+        return Aggregate[Company](data=company, fontes=sources, avisos=warnings, degraded=degraded)
 
-    async def _enrich(self, cep: str, warnings: list[str]) -> tuple[Address | None, SourceInfo]:
-        """Reuses the CEP aggregator (and its cache). A failure here degrades, never breaks."""
+    async def _enrich(
+        self, cep: str, warnings: list[str]
+    ) -> tuple[Address | None, SourceInfo, bool]:
+        """Reuses the CEP aggregator (and its cache). A failure here degrades, never breaks.
+
+        Returns (address, source info, degraded).
+        """
         start = time.perf_counter()
         try:
             agg = await self._cep.lookup(normalize_cep(cep))
         except AppError as exc:
             warnings.append(f"Endereço não enriquecido: {exc.detail or exc.title}.")
-            return None, SourceInfo(
-                nome="raiox:cep",
-                status=SourceStatus.ERROR,
-                latencia_ms=ms_since(start),
-                detalhe=exc.detail,
+            status = (
+                SourceStatus.NOT_FOUND if isinstance(exc, NotFoundError) else SourceStatus.ERROR
             )
+            info = SourceInfo(
+                nome="raiox:cep", status=status, latencia_ms=ms_since(start), detalhe=exc.detail
+            )
+            return None, info, status in TRANSIENT_FAILURES
         warnings.extend(f"[cep] {w}" for w in agg.value.avisos)
-        return agg.value.data, SourceInfo(
+        info = SourceInfo(
             nome="raiox:cep",
             status=SourceStatus.OK,
             latencia_ms=ms_since(start),
             detalhe=f"cache {agg.status}",
         )
+        return agg.value.data, info, agg.value.degraded

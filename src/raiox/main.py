@@ -23,6 +23,7 @@ from raiox.infra.rate_limit import OutboundLimiter, SlidingWindowRateLimiter
 from raiox.providers.base import BaseProvider
 from raiox.providers.cep import BrasilApiCep, IbgeMunicipalities, OpenCep, ViaCep
 from raiox.providers.cnpj import BrasilApiCnpj, CnpjWs, ReceitaWs
+from raiox.providers.ibge_snapshot import IbgeSnapshot
 from raiox.security.api_keys import ApiKeyStore
 from raiox.services.cep_service import CepService
 from raiox.services.company_service import CompanyService
@@ -53,6 +54,7 @@ def build_container(
         base_url: str,
         *,
         retries: int | None = None,
+        timeout_s: float | None = None,
         limiter: OutboundLimiter | None = None,
         breaker_name: str | None = None,
     ) -> BaseProvider:
@@ -66,7 +68,7 @@ def build_container(
             http,
             base_url=base_url,
             breaker=breaker,
-            timeout_s=settings.upstream_timeout_s,
+            timeout_s=timeout_s or settings.upstream_timeout_s,
             retries=settings.upstream_retries if retries is None else retries,
             retry_base_delay_s=settings.retry_base_delay_s,
             retry_max_delay_s=settings.retry_max_delay_s,
@@ -93,8 +95,17 @@ def build_container(
         make(ViaCep, settings.viacep_url, breaker_name="viacep"),
         make(OpenCep, settings.opencep_url, breaker_name="opencep"),
     ]
-    ibge = make(IbgeMunicipalities, settings.ibge_url, breaker_name="ibge")
-    cep_service = CepService(cep_providers, ibge, cache, settings)  # type: ignore[arg-type]
+    # IBGE runs under the enrichment deadline: no retries, and a timeout just below the
+    # deadline so the provider itself times out (and feeds the circuit breaker) instead of
+    # being silently cancelled by the outer deadline.
+    ibge = make(
+        IbgeMunicipalities,
+        settings.ibge_url,
+        breaker_name="ibge",
+        retries=0,
+        timeout_s=max(0.2, settings.enrichment_deadline_s * 0.8),
+    )
+    cep_service = CepService(cep_providers, ibge, IbgeSnapshot(), cache, settings)  # type: ignore[arg-type]
 
     # Quota-limited sources get no retries: the fallback chain itself is the "retry".
     cnpj_chain = [

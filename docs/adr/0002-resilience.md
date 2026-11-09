@@ -14,6 +14,9 @@ Breaker: `closed → open` after N consecutive failures; after `reset_timeout`, 
 ## Trade-off: in-process breaker
 Breaker state lives in memory per replica. With R replicas, a source may receive up to `R × N` calls before every breaker opens. For a few replicas that is acceptable and avoids a Redis round-trip on every call. With dozens of replicas, the way forward is to move the state into Redis (same Lua pattern as the rate limiter).
 
+## Enrichment
+Optional enrichment (IBGE municipality) runs under its own hard deadline, with no retries and a provider timeout just below that deadline, so timeouts still reach the breaker. See ADR 0007.
+
 ## Consequences
 - A source going down → after N failures, lookups fail in milliseconds instead of waiting for the timeout (validated: ~8 ms).
 - `/ready` exposes the circuit states. Sources being down do **not** take the instance out of the load balancer, because it can still serve from cache.
