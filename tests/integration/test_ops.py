@@ -41,3 +41,9 @@ async def test_openapi_documents_security_and_errors(client: httpx.AsyncClient) 
 def test_weak_admin_token_rejected_in_production() -> None:
     with pytest.raises(ValueError, match="32"):
         Settings(_env_file=None, env="prod")  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize("bad", ["demo-key-without-prefix-123456", "rx_live_short"])
+def test_invalid_demo_key_rejected(bad: str) -> None:
+    with pytest.raises(ValueError, match="RAIOX_DEMO_API_KEY"):
+        Settings(_env_file=None, demo_api_key=bad)  # type: ignore[call-arg, arg-type]

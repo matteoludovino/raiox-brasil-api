@@ -8,7 +8,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-Plan = Literal["free", "pro"]
+Plan = Literal["free", "pro", "demo"]
+API_KEY_PREFIX = "rx_live_"
 
 
 class Settings(BaseSettings):
@@ -52,6 +53,11 @@ class Settings(BaseSettings):
     rate_limit_window_s: int = Field(default=60, ge=1)
     rate_limit_free: int = Field(default=30, ge=1)
     rate_limit_pro: int = Field(default=300, ge=1)
+    # Shared by every visitor of the public demo, so it is deliberately low.
+    rate_limit_demo: int = Field(default=20, ge=1)
+
+    # --- Public demo key (seeded idempotently at startup) ---------------------------
+    demo_api_key: SecretStr | None = None
 
     # --- Outbound quota (token bucket per source, req/min) -------------------------
     outbound_cnpjws_per_min: int = Field(default=3, ge=1)
@@ -59,13 +65,28 @@ class Settings(BaseSettings):
 
     @property
     def rate_limits(self) -> dict[Plan, int]:
-        return {"free": self.rate_limit_free, "pro": self.rate_limit_pro}
+        return {
+            "free": self.rate_limit_free,
+            "pro": self.rate_limit_pro,
+            "demo": self.rate_limit_demo,
+        }
 
     @model_validator(mode="after")
     def _require_strong_admin_token_in_prod(self) -> Settings:
         token = self.admin_token.get_secret_value()
         if self.env == "prod" and (token == "change-me" or len(token) < 32):  # noqa: S105
             raise ValueError("RAIOX_ADMIN_TOKEN must be at least 32 characters in production")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_demo_key(self) -> Settings:
+        if self.demo_api_key is None:
+            return self
+        key = self.demo_api_key.get_secret_value()
+        if not key.startswith(API_KEY_PREFIX) or len(key) < len(API_KEY_PREFIX) + 16:
+            raise ValueError(
+                f"RAIOX_DEMO_API_KEY must start with {API_KEY_PREFIX!r} and have 16+ random chars"
+            )
         return self
 
 

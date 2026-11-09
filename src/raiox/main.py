@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from raiox import __version__
 from raiox.api.deps import Container
@@ -117,6 +118,19 @@ def build_container(
     return container, breakers
 
 
+async def _seed_demo_key(container: Container, settings: Settings) -> None:
+    """Keeps the public demo key published in the README valid, even if Redis is recreated."""
+    if settings.demo_api_key is None:
+        return
+    try:
+        info = await container.keys.ensure_demo(settings.demo_api_key.get_secret_value())
+    except RedisError as exc:
+        # Don't block startup: the rest of the API can still come up and /ready will report it.
+        log.warning("demo_key_seed_failed", error=str(exc))
+        return
+    log.info("demo_key_ready", key_id=info.id, prefix=info.prefix)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -141,6 +155,7 @@ def create_app(
         app.state.container = container
         app.state.redis = r
         app.state.breakers = breakers
+        await _seed_demo_key(container, settings)
         log.info("startup", env=settings.env, version=__version__)
         try:
             yield

@@ -22,9 +22,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
-from raiox.core.config import Plan
+from raiox.core.config import API_KEY_PREFIX, Plan
 
-KEY_PREFIX = "rx_live_"
+KEY_PREFIX = API_KEY_PREFIX
+DEMO_KEY_ID = "k_demo"
 
 
 class ApiKeyInfo(BaseModel):
@@ -61,18 +62,39 @@ class ApiKeyStore:
             created_at=datetime.now(UTC),
             key=raw,
         )
+        await self._store(info, hash_key(raw))
+        return info
+
+    async def ensure(self, raw: str, *, key_id: str, name: str, plan: Plan) -> ApiKeyInfo:
+        """Idempotently registers a well-known key (e.g. the public demo key).
+
+        Safe to call on every startup. If ``key_id`` already points to a different key
+        (the secret was rotated), the old key is revoked so it stops working.
+        """
         digest = hash_key(raw)
+        if existing := await self._r.hgetall(f"{self._p}:apikey:{digest}"):
+            return ApiKeyInfo.model_validate(existing)
+        await self.revoke(key_id)
+        info = ApiKeyInfo(
+            id=key_id,
+            name=name,
+            plan=plan,
+            prefix=raw[: len(KEY_PREFIX) + 5],
+            created_at=datetime.now(UTC),
+        )
+        await self._store(info, digest)
+        return info
+
+    async def ensure_demo(self, raw: str) -> ApiKeyInfo:
+        return await self.ensure(raw, key_id=DEMO_KEY_ID, name="public-demo", plan="demo")
+
+    async def _store(self, info: ApiKeyInfo, digest: str) -> None:
+        mapping = {k: str(v) for k, v in info.model_dump(mode="json", exclude={"key"}).items()}
         async with self._r.pipeline(transaction=True) as pipe:
-            pipe.hset(
-                f"{self._p}:apikey:{digest}",
-                mapping={
-                    k: str(v) for k, v in info.model_dump(mode="json", exclude={"key"}).items()
-                },
-            )
+            pipe.hset(f"{self._p}:apikey:{digest}", mapping=mapping)
             pipe.set(f"{self._p}:apikey_id:{info.id}", digest)
             pipe.sadd(f"{self._p}:apikeys", info.id)
             await pipe.execute()
-        return info
 
     async def verify(self, raw: str) -> ApiKeyInfo | None:
         if not raw.startswith(KEY_PREFIX):

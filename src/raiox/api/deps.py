@@ -56,6 +56,9 @@ async def require_api_key(
         )
     try:
         info = await c.keys.verify(raw)
+        if info is None and _is_demo_key(c.settings, raw):
+            # Self-heal: Redis was reset after startup (e.g. managed Redis flushed).
+            info = await c.keys.ensure_demo(raw)
     except RedisError as exc:
         # Without Redis we cannot validate the key: fail closed (security over availability).
         raise DependencyUnavailableError("Armazenamento de credenciais indisponível") from exc
@@ -64,6 +67,13 @@ async def require_api_key(
             "API key inválida ou revogada", headers={"WWW-Authenticate": "ApiKey"}
         )
     return info
+
+
+def _is_demo_key(settings: Settings, raw: str) -> bool:
+    demo = settings.demo_api_key
+    return demo is not None and secrets.compare_digest(
+        raw.encode(), demo.get_secret_value().encode()
+    )
 
 
 async def enforce_rate_limit(

@@ -116,7 +116,7 @@ CEP sources are free and **complementary**: BrasilAPI has coordinates, ViaCEP ha
 - **Fail-open**: Redis being down doesn't break lookups, it only disables the cache.
 
 ### 4. Rate limiting and quotas ([ADR 0004](docs/adr/0004-rate-limit.md))
-- **Inbound:** *sliding window counter* in **atomic Lua**, per API key and plan (`free`: 30/min, `pro`: 300/min). O(1) memory per client, versus O(limit) for a sorted-set log. `RateLimit-*` and `Retry-After` headers.
+- **Inbound:** *sliding window counter* in **atomic Lua**, per API key and plan (`demo`: 20/min, `free`: 30/min, `pro`: 300/min). O(1) memory per client, versus O(limit) for a sorted-set log. `RateLimit-*` and `Retry-After` headers.
 - **Outbound:** per-source *token bucket* (CNPJ.ws and ReceitaWS: 3/min), shared across replicas. When the bucket is empty, the chain skips the source instead of taking a third-party 429. An exhausted local quota does **not** open the circuit, because the limit was ours, not the source's.
 
 ### 5. Authentication ([ADR 0005](docs/adr/0005-api-keys.md))
@@ -163,6 +163,20 @@ make install
 docker run -d -p 6379:6379 redis:7.4-alpine
 make dev
 ```
+
+**Deploying to Fly.io:** the repo ships a [`fly.toml`](fly.toml) (São Paulo region, auto-stop when idle, `/health` check).
+```bash
+fly launch --no-deploy --copy-config          # creates the app from fly.toml
+fly redis create                              # Upstash Redis on Fly's private network
+fly secrets set \
+  RAIOX_ADMIN_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')" \
+  RAIOX_DEMO_API_KEY="$(python -c "import secrets; print('rx_live_' + secrets.token_urlsafe(24))")" \
+  RAIOX_REDIS_URL="redis://default:...@....upstash.io:6379"
+fly deploy
+```
+Set the secrets **before** the first deploy: with `RAIOX_ENV=prod` the app refuses to boot with a weak admin token.
+
+**Public demo key:** when `RAIOX_DEMO_API_KEY` is set, the key is registered at startup with the low-limit `demo` plan. Registration is idempotent and self-heals if Redis is reset while the app is running, so the key published in a README stays valid. Rotating the secret revokes the old key on the next boot.
 
 **Simulating failures:** point a source at an invalid host in `.env` (e.g. `RAIOX_BRASILAPI_URL=https://x.invalid`) and recreate the container. The warnings show up in `meta`, and `/ready` reports the circuit states.
 

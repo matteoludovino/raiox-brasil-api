@@ -1,0 +1,38 @@
+# Fly.io deployment. Secrets (never in this file):
+#   fly secrets set RAIOX_ADMIN_TOKEN=... RAIOX_REDIS_URL=... RAIOX_DEMO_API_KEY=...
+# App names are global on Fly: if "raiox-brasil-api" is taken, change it here.
+app = "raiox-brasil-api"
+primary_region = "gru" # São Paulo: close to the Brazilian upstream sources
+
+[build]
+# Uses the repository Dockerfile.
+
+[env]
+RAIOX_ENV = "prod" # refuses to boot with a weak RAIOX_ADMIN_TOKEN
+RAIOX_LOG_JSON = "true"
+RAIOX_LOG_LEVEL = "INFO"
+
+[http_service]
+internal_port = 8000
+force_https = true
+auto_stop_machines = "stop"   # idle machines stop: near-zero cost for a demo
+auto_start_machines = true
+min_machines_running = 0      # trade-off: a few seconds of cold start after idle
+
+[http_service.concurrency]
+type = "requests"
+soft_limit = 50
+hard_limit = 100
+
+# Liveness only. /ready is NOT used here: a Redis hiccup would make Fly kill a
+# machine that can still answer (see ADR 0002).
+[[http_service.checks]]
+method = "GET"
+path = "/health"
+interval = "15s"
+timeout = "3s"
+grace_period = "10s"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "512mb"

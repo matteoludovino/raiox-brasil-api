@@ -1,5 +1,6 @@
 import httpx
 import respx
+from pydantic import SecretStr
 
 from tests import payloads as p
 from tests.conftest import ADMIN_TOKEN, mock_cep
@@ -75,3 +76,46 @@ async def test_admin_requires_token(client: httpx.AsyncClient) -> None:
     r = await client.post("/admin/api-keys", json={"name": "x", "plan": "gold"}, headers=ADMIN)
     assert r.status_code == 422
     assert r.json()["errors"]
+
+
+async def test_demo_key_is_seeded_at_startup_with_its_own_limit(
+    settings, redis, upstream: respx.MockRouter
+) -> None:
+    from asgi_lifespan import LifespanManager
+
+    from raiox.main import create_app
+
+    demo_key = "rx_live_demo_aaaaaaaaaaaaaaaaaaaa"
+    demo_settings = settings.model_copy(
+        update={"demo_api_key": SecretStr(demo_key), "rate_limit_demo": 2}
+    )
+    mock_cep(upstream)
+    async with httpx.AsyncClient() as http:
+        app = create_app(demo_settings, redis=redis, http_client=http)
+        async with (
+            LifespanManager(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client,
+        ):
+            headers = {"X-API-Key": demo_key}
+            statuses = [
+                (await client.get(f"/v1/cep/{p.CEP}", headers=headers)).status_code
+                for _ in range(3)
+            ]
+            assert statuses == [200, 200, 429]
+
+            r = await client.get(f"/v1/cep/{p.CEP}", headers=headers)
+            assert r.headers["ratelimit-limit"] == "2"
+            assert "demo" in r.json()["detail"]
+
+            keys = (await client.get("/admin/api-keys", headers=ADMIN)).json()
+            assert [(k["id"], k["plan"]) for k in keys] == [("k_demo", "demo")]
+
+            # Redis reset after startup: the demo key self-heals on the next request.
+            await redis.flushall()
+            r = await client.get(f"/v1/cep/{p.CEP}", headers=headers)
+            assert r.status_code == 200
+            # ...but a random key is still rejected.
+            r = await client.get(f"/v1/cep/{p.CEP}", headers={"X-API-Key": demo_key + "x"})
+            assert r.status_code == 401
