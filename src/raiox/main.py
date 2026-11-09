@@ -145,7 +145,15 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         own_redis = redis is None
         own_http = http_client is None
-        r = redis or Redis.from_url(settings.redis_url, decode_responses=True)
+        r = redis or Redis.from_url(
+            settings.redis_url,  # rediss:// enables TLS (managed Redis such as Upstash)
+            decode_responses=True,
+            # Managed Redis over the internet: never hang a request on a dead socket, and
+            # ping idle pooled connections so the provider closing them isn't a surprise.
+            socket_connect_timeout=settings.redis_timeout_s,
+            socket_timeout=settings.redis_timeout_s,
+            health_check_interval=30,
+        )
         http = http_client or httpx.AsyncClient(
             headers={"User-Agent": f"raiox-brasil-api/{__version__}"},
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),

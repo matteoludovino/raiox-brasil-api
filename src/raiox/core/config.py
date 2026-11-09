@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     log_json: bool = True
 
     redis_url: str = "redis://localhost:6379/0"
+    redis_timeout_s: float = Field(default=3.0, gt=0)
     cache_prefix: str = "raiox:v1"
     admin_token: SecretStr = SecretStr("change-me")
 
