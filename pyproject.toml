@@ -1,0 +1,75 @@
+[project]
+name = "raiox"
+version = "0.1.0"
+description = "Aggregator API for Brazilian public data (CEP and CNPJ) with auth, caching and rate limiting"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Matteo Ludovino", email = "matteoludovino@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.162.2",
+    "httpx>=0.28.1",
+    "prometheus-client>=0.26.0",
+    "pydantic-settings>=2.16.2",
+    "redis>=5",
+    "structlog>=26.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.16,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "asgi-lifespan>=2.1.0",
+    "fakeredis[lua]>=2.40.0",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "pytest-cov>=7.1.0",
+    "respx>=0.23.1",
+    "ruff>=0.17.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "S", "RUF", "PT", "C4", "RET"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # Portuguese API strings with accents are intentional
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311"]
+"src/raiox/infra/resilience.py" = ["S311"]  # jitter is not a cryptographic use
+"src/raiox/infra/rate_limit.py" = ["S105"]  # false positive: "TOKEN" in the Lua script name
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["fakeredis.*", "respx.*", "asgi_lifespan.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers"
+
+[tool.coverage.run]
+source = ["raiox"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 85
+exclude_also = ["if TYPE_CHECKING:", "\\.\\.\\."]
